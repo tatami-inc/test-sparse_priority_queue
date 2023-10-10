@@ -21,8 +21,8 @@ Priority queue access time: 8713 for 99997920 non-zero elements
 ```
 
 With hindsight, this is perhaps unsurprising.
-The heap takes `O(Nz * log(N))` time to depopulate and fill, given `N` columns and `Nz` non-zero elements.
-The linear search just takes `O(N)` time, which becomes faster than the heap when `Nz` is a decent fraction of `N`.
+The queue takes `O(Nz * log(N))` time to depopulate and fill, given `N` columns and `Nz` non-zero elements.
+The linear search just takes `O(N)` time, which becomes faster than the queue when `Nz` is a decent fraction of `N`.
 Even at 5% density, we still observe a mild performance degradation:
 
 ```console
@@ -44,14 +44,17 @@ Priority queue access time: 930 for 9997846 non-zero elements
 # Discussion
 
 Turns out that linear iteration is pretty fast if there's no action involved other than to hit `continue`. 
-Indeed, **tatami** stores the `current_indices` vector that can be iterated contiguously in memory for optimal access, unlike the heap where everything is scattered around via push/pop cycles.
+Indeed, **tatami** stores the `current_indices` vector that can be iterated contiguously in memory for optimal access,
+unlike the queue where information for adjacent columns are scattered around via push/pop cycles to the underlying heap.
 I suspect that the linear search is also very friendly to the branch predictor for very sparse rows where most columns can be skipped.
 
-Note that this demonstration is already a best-case example of using the heap.
-If it's not a strict increment, we might need to sort the indices of the non-zero elements extracted from each row, because they won't come out of the heap in order.
-Moreover, if there is a large jump between the previous and current requested row, the heap information is useless and we collapse back to `O(N)` time anyway (with extra overhead to rebuild the heap).
+Note that this demonstration is already a best-case example of using the queue.
+If it's not a strict increment, we have to pop the queue until we get to the row we want, incurring wasteful `log(N)` pushes;
+or we can scan the underlying heap directly, but then the indices of the non-zero elements won't come out in order and we'll need to resort them.
+Moreover, if there is a large jump between the previous and current requested row, 
+the information in the queue is useless and we collapse back to `O(N)` time anyway (with extra overhead to rebuild the queue).
 
-I suppose we _could_ switch between the linear and heap methods depending on the sparsity of the matrix, but that seems pretty complicated.
+I suppose we _could_ switch between the linear and queue methods depending on the sparsity of the matrix, but that seems pretty complicated.
 Given the absence of an unqualified performance benefit, I will prefer the simplicity of the linear search.
 
 # Build instructions
