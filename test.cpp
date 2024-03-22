@@ -1,13 +1,194 @@
 #include "CLI/App.hpp"
 #include "CLI/Formatter.hpp"
 #include "CLI/Config.hpp"
-
-#include "tatami/tatami.hpp"
+#include "nanobench.h"
 
 #include <chrono>
 #include <vector>
 #include <queue>
 #include <random>
+
+struct Linear {
+private:
+    const std::vector<std::vector<int> >& indices;
+    int max_index;
+
+private:
+    // The cached position of the pointer at each primary element.
+    // Specifically, 'indices[i][cached_indptrs[i]]' is the lower bound for 'last_request' in the primary element 'i'.
+    std::vector<size_t> cached_indptrs; 
+
+    // This vector contains the cached index being pointed to by 'cached_indptrs'.
+    // We store this here as it is more cache-friendly than doing a look-up to 'indices' every time.
+    std::vector<int> cached_indices;
+
+    // Closest value in 'cached_indices' to the 'last_request', to see whether we can short-circuit the iteration.
+    // This is the minimum of values in 'cached_indices'.
+    int closest_cached_index = 0;
+
+    // This is the first position of 'cached_indices' equal to 'closest_cached_index',
+    // i.e., 'cached_indices[closest_cached_index_position] == closest_cached_index'.
+    size_t closest_cached_index_position = 0;
+
+    // What was the last requested index on the secondary dimension?
+    int last_request = 0;
+
+public:
+    Linear(const std::vector<std::vector<int> >& idx, int mi) : 
+        indices(idx), 
+        max_index(mi), 
+        cached_indptrs(indices.size()), 
+        cached_indices(indices.size())
+    {
+        for (size_t p = 0, pend = indices.size(); p < pend; ++p) {
+            const auto& curi = indices[p];
+            cached_indices[p] = (curi.empty() ? max_index : curi.front());
+        }
+        if (!cached_indices.empty()) {
+            auto closestIt = std::min_element(cached_indices.begin(), cached_indices.end());
+            closest_cached_index_position = closestIt - cached_indices.begin();
+            closest_cached_index = *closestIt;
+        }
+    }
+
+private:
+    template<class Store_>
+    void search_above(int secondary, int primary, Store_ store) {
+        // Skipping if the curdex (corresponding to curptr) is already higher
+        // than secondary. So, we only need to do more work if the request is
+        // greater than the stored index. This also catches cases where we're
+        // at the end of the dimension, as curdex is set to max_index.
+        auto& curdex = cached_indices[primary];
+        if (curdex > secondary) {
+            return;
+        }
+
+        auto& curptr = cached_indptrs[primary];
+        if (curdex == secondary) {
+            store(primary, cached_indptrs[primary]);
+            return;
+        }
+
+        // Having a peek at the index of the next non-zero element; the
+        // requested index should be equal to or below this, as would be the
+        // case for consecutive accesses. An actual implementation would have
+        // to account for non-consecutive jumps but we'll keep things simple
+        // here for a comparison to an equally simple queue implementation.
+        ++curptr;
+        const auto& curi = indices[primary];
+        auto endptr = curi.size();
+        if (curptr == endptr) {
+            curdex = max_index;
+            return;
+        }
+
+        auto iraw = curi.begin();
+        auto inext = iraw + curptr;
+        curdex = *inext;
+        if (curdex == secondary) {
+            store(primary, curptr);
+            return;
+        }
+    }
+
+public:
+    template<class Store_>
+    void search_simple(int secondary, Store_ store) {
+        for (size_t p = 0, pend = indices.size(); p < pend; ++p) {
+            search_above(secondary, p, store);
+        }
+        last_request = secondary;
+    }
+
+    template<class Store_>
+    void search_shortcircuit(int secondary, Store_ store) {
+        if (secondary < closest_cached_index) {
+            last_request = secondary;
+            return; 
+        }
+
+        bool found = false;
+        for (size_t p = 0, pend = indices.size(); p < pend; ++p) {
+            search_above(secondary, p, [&](int i, size_t s) {
+                store(i, s);
+                found = true;
+            });
+        }
+
+        if (found) {
+            closest_cached_index = secondary;
+        } else {
+            closest_cached_index = *(std::min_element(cached_indices.begin(), cached_indices.end()));
+        }
+
+        last_request = secondary; 
+    }
+};
+
+struct Pqueue {
+private:
+    const std::vector<std::vector<int> >& indices;
+
+    typedef std::pair<int, int> HeapElement;
+    std::priority_queue<HeapElement, std::vector<HeapElement>, std::greater<HeapElement> > next_heap;
+
+    std::vector<int> hits, tmp_hits;
+    std::vector<size_t> state;
+
+public:
+    Pqueue(const std::vector<std::vector<int> >& idx) : indices(idx), hits(indices.size()), state(indices.size()) {
+        for (size_t c = 0, cend = indices.size(); c < cend; ++c) { // force everything to be re-searched on initialization.
+            hits[c] = c;
+            --state[c];
+        }
+    }
+
+public:
+    template<class Store_>
+    void search(int secondary, Store_ store) {
+        tmp_hits.swap(hits);
+        hits.clear();
+
+        // Refilling the indices we popped out in the last round.  This gives
+        // us an opportunity to check whether they're equal to the current
+        // 'secondary' (and thus elide an insertion into the queue).
+        for (auto x : tmp_hits) {
+            ++state[x];
+            const auto& curx = indices[x];
+            if (state[x] < curx.size()) {
+                int current = curx[state[x]];
+                if (current == secondary) {
+                    hits.push_back(x);
+                } else {
+                    next_heap.emplace(current, x);
+                }
+            }
+        }
+
+        // Finding all the queue elements equal to our current position.
+        // No need to do anything fancy when we're just incrementing;
+        // it's always going to be '>= secondary'.
+        while (!next_heap.empty()) {
+            auto current_secondary = next_heap.top().first;
+            if (current_secondary > secondary) {
+                break;
+            }
+            auto current_primary_index = next_heap.top().second;
+            next_heap.pop();
+            hits.push_back(current_primary_index);
+        }
+
+        /* 
+         * We're going to paint the priority queue in the best possible light
+         * here by skipping the sort step, which is technically necessary to
+         * have 1:1 feature parity with the linear methods.
+         */
+        // std::sort(hits.begin(), hits.end()); 
+        for (auto x : hits) {
+            store(x, state[x]);
+        }
+    } 
+};
 
 int main(int argc, char* argv []) {
     CLI::App app{"Sparse priority queue testing"};
@@ -16,116 +197,69 @@ int main(int argc, char* argv []) {
     int nr;
     app.add_option("-r,--nrow", nr, "Number of rows")->default_val(10000);
     int nc;
-    app.add_option("-c,--ncol", nc, "Number of columns")->default_val(100000);
+    app.add_option("-c,--ncol", nc, "Number of columns")->default_val(50000);
     CLI11_PARSE(app, argc, argv);
 
     std::cout << "Testing a " << nr << " x " << nc << " matrix with a density of " << density << std::endl;
 
     // Simulating a sparse matrix, albeit not very efficiently, but whatever.
-    std::vector<int> i, j;
-    std::vector<double> x;
-
+    std::vector<std::vector<int> > i(nc);
     std::mt19937_64 generator(1234567);
     std::uniform_real_distribution<double> distu;
-    std::normal_distribution<double> distn;
 
     for (size_t c = 0; c < nc; ++c) {
+        auto& curi = i[c];
         for (size_t r = 0; r < nr; ++r) {
             if (distu(generator) <= density) {
-                i.push_back(r);
-                j.push_back(c);
-                x.push_back(distn(generator));
+                curi.push_back(r);
             }
         }
     }
 
-    auto indptrs = tatami::compress_sparse_triplets<false>(nr, nc, x, i, j);
-    tatami::ArrayView<double> x_view (x.data(), x.size());
-    tatami::ArrayView<int> i_view (i.data(), i.size());
-    tatami::ArrayView<size_t> p_view (indptrs.data(), indptrs.size());
-    std::shared_ptr<tatami::NumericMatrix> mat(new tatami::CompressedSparseColumnMatrix<double, int, decltype(x_view), decltype(i_view), decltype(p_view)>(nr, nc, x_view, i_view, p_view));
-
-    // Doing the naive linear iteration that's currently in tatami.
-    std::vector<double> xbuffer(mat->ncol());
-    std::vector<int> ibuffer(mat->ncol());
-
-    auto start = std::chrono::high_resolution_clock::now();
-    auto wrk = mat->sparse_row();
-    int sum = 0;
-    for (int r = 0; r < mat->nrow(); ++r) {
-        auto range = wrk->fetch(r, xbuffer.data(), ibuffer.data());
-        sum += range.number;
+    size_t expected = 0;
+    {
+        Linear linear(i, nr);
+        for (size_t r = 0; r < nr; ++r) {
+            linear.search_simple(r, [&](int, size_t) { ++expected; });
+        }
+        std::cout << "Expecting a sum of " << expected << std::endl;
     }
-    auto stop = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
-    std::cout << "Linear access time: " << duration.count() << " for " << sum << " non-zero elements" << std::endl;
+
+    // Doing the linear iteration with simple caching.
+    ankerl::nanobench::Bench().run("linear simple", [&](){
+        Linear linear(i, nr);
+        size_t sum = 0;
+        for (size_t r = 0; r < nr; ++r) {
+            linear.search_simple(r, [&](int, size_t) { ++sum; });
+        }
+        if (sum != expected) {
+            std::cerr << "WARNING: different result from linear access (" << sum << ")" << std::endl;
+        }
+    });
+
+    // Doing the linear iteration with more caching.
+    ankerl::nanobench::Bench().run("linear shortcircuit", [&](){
+        Linear linear(i, nr);
+        size_t sum = 0;
+        for (size_t r = 0; r < nr; ++r) {
+            linear.search_shortcircuit(r, [&](int, size_t) { ++sum; });
+        }
+        if (sum != expected) {
+            std::cerr << "WARNING: different result from linear shortcircuit access (" << sum << ")" << std::endl;
+        }
+    });
 
     // Comparing to a priority queue.
-    start = std::chrono::high_resolution_clock::now();
-
-    typedef std::pair<int, int> HeapElement;
-    std::priority_queue<HeapElement, std::vector<HeapElement>, std::greater<HeapElement> > next_heap;
-    std::vector<int> hits, tmp_hits;
-    auto state = indptrs;
-
-    hits.resize(mat->ncol());
-    for (int c = 0; c < mat->ncol(); ++c) { // force everything to be re-searched on initialization.
-        hits[c] = c;
-        --state[c];
-    }
-
-    sum = 0;
-    for (int r = 0; r < mat->nrow(); ++r) {
-        tmp_hits.swap(hits);
-        hits.clear();
-
-        for (auto x : tmp_hits) {
-            ++state[x];
-            if (state[x] < indptrs[x + 1]) {
-                int current = i[state[x]];
-                if (current == r) {
-                    hits.push_back(x);
-                } else {
-                    next_heap.emplace(current, x);
-                }
-            }
+    ankerl::nanobench::Bench().run("queue", [&](){
+        Pqueue pqueue(i);
+        size_t sum = 0;
+        for (size_t r = 0; r < nr; ++r) {
+            pqueue.search(r, [&](int, size_t) { ++sum; });
         }
-
-        while (!next_heap.empty()) {
-            auto current_secondary = next_heap.top().first;
-            if (current_secondary > r) {
-                break;
-            }
-            auto current_primary_index = next_heap.top().second;
-            next_heap.pop();
-
-            if (current_secondary < r) {
-                ++state[current_primary_index];
-                if (state[current_primary_index] < indptrs[current_primary_index + 1]) {
-                    int next_secondary = i[state[current_primary_index]];
-                    if (next_secondary == r) {
-                        hits.push_back(current_primary_index);
-                    } else {
-                        next_heap.emplace(next_secondary, current_primary_index);
-                    }
-                }
-            } else {
-                hits.push_back(current_primary_index);
-            }
+        if (sum != expected) {
+            std::cerr << "WARNING: different result from queue access (" << sum << ")" << std::endl;
         }
-
-        // Copy indices over for a fair comparison.
-        for (size_t h = 0; h < hits.size(); ++h) {
-            ibuffer[h] = hits[h];
-            xbuffer[h] = x[state[h]];
-        }
-
-        sum += hits.size();
-    } 
-
-    stop = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start);
-    std::cout << "Priority queue access time: " << duration.count() << " for " << sum << " non-zero elements" << std::endl;
+    });
 
     return 0;
 }
